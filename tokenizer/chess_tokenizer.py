@@ -54,6 +54,7 @@ Example packed token for "e2e4" (token_id=512) with 5s spent, white winning:
     packed       = 0x00060200
 """
 
+from typing import Dict, List, Optional
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -261,7 +262,7 @@ class ChessTokenizer:
             "outcome":   outcome,
         }
 
-    def decode_game(self, tokens: np.ndarray) -> list[dict]:
+    def decode_game(self, tokens: np.ndarray) -> List[dict]:
         """Decode a full token array into a list of human-readable dicts."""
         return [self.decode_token(t) for t in tokens]
 

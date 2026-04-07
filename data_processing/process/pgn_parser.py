@@ -36,6 +36,7 @@ import os
 import time
 from multiprocessing import Process, Queue, Value
 from os.path import dirname
+from typing import List, Optional, Tuple
 
 import zstandard as zstd
 from chess import pgn
@@ -74,7 +75,7 @@ BLITZ_TIME_CONTROLS = {
 # Core parsing logic
 # ---------------------------------------------------------------------------
 
-def parse_time_control(tc: str) -> tuple[int, int]:
+def parse_time_control(tc: str) -> Tuple[int, int]:
     """
     Parse a Lichess time control string into (base_seconds, increment_seconds).
 
@@ -87,7 +88,7 @@ def parse_time_control(tc: str) -> tuple[int, int]:
         raise ValueError(f"Cannot parse time control: {tc!r}")
 
 
-def extract_moves_and_times(game) -> tuple[str, list[int]]:
+def extract_moves_and_times(game) -> Tuple[str, List[int]]:
     """
     Walk through a parsed game tree and extract moves + time spent per move.
 
@@ -125,7 +126,7 @@ def extract_moves_and_times(game) -> tuple[str, list[int]]:
     return " ".join(moves), move_times
 
 
-def game_to_dict(game, valid_time_controls: set) -> dict | None:
+def game_to_dict(game, valid_time_controls: set) -> Optional[dict]:
     """
     Convert a python-chess Game object into our JSONL dict format.
 

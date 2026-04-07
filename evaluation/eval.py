@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 from collections import defaultdict
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -43,7 +44,7 @@ def elo_bin(elo: int, bin_size: int = 100) -> str:
     return str((elo // bin_size) * bin_size)
 
 
-def load_test_games(test_dir: str) -> list[dict]:
+def load_test_games(test_dir: str) -> List[dict]:
     """Load all *test.jsonl files from the test directory."""
     games = []
     for fname in sorted(os.listdir(test_dir)):

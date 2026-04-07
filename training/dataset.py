@@ -16,6 +16,7 @@ The model is trained to predict the NEXT token at every position simultaneously
 (standard language model training), so labels = input_ids shifted left by 1.
 """
 
+from typing import Dict
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -63,7 +64,7 @@ class ChessBinDataset(Dataset):
     def __len__(self) -> int:
         return self.n_windows
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Return one training window starting at position idx.
 

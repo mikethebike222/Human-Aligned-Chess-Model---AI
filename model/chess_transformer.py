@@ -19,6 +19,7 @@ Think of it like a dial from 0 to 1: a 1750 Elo player gets a blend that's
 roughly 50% of the way between weak and strong.
 """
 
+from typing import Dict
 import torch
 import torch.nn as nn
 from transformers import GPT2Config, GPT2Model
@@ -171,7 +172,7 @@ class ChessTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,            # (batch, seq_len)
         attention_mask: torch.Tensor,       # (batch, seq_len) — 1 for real tokens, 0 for pad
-    ) -> dict[str, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through embedding → transformer → three heads.
 

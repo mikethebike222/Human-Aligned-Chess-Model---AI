@@ -20,6 +20,7 @@ import argparse
 import math
 import os
 import time
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,7 +40,7 @@ def compute_loss(
     labels: torch.Tensor,
     time_labels: torch.Tensor,
     value_labels: torch.Tensor,
-) -> tuple[torch.Tensor, dict]:
+) -> Tuple[torch.Tensor, dict]:
     """
     Compute the three-part loss.
 
