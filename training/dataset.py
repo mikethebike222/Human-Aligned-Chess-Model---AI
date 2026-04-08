@@ -62,11 +62,15 @@ class ChessBinDataset(Dataset):
         print(f"  {self.n_tokens:,} tokens  |  {self.n_windows:,} possible windows")
 
     def __len__(self) -> int:
-        return self.n_windows
+        # Return a fixed epoch size instead of n_windows (which can be 7B+).
+        # PyTorch's shuffle=True calls randperm(__len__) — if __len__ is 7B
+        # that requires 60GB of RAM just for indices.
+        # Instead we pick random offsets ourselves in __getitem__.
+        return 100_000
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Return one training window starting at position idx.
+        Return one training window at a random position (idx is ignored).
 
         Unpacks the packed uint32 format into separate tensors:
           - input_ids:     (seq_len,)  token IDs for model input
@@ -75,6 +79,9 @@ class ChessBinDataset(Dataset):
           - value_labels:  (seq_len,)  game outcome (-100 if padding)
           - attention_mask:(seq_len,)  1.0 for real tokens, 0.0 for pad
         """
+        # Pick a random start position — ignore idx to avoid OOM from randperm
+        idx = int(self.rng.integers(0, self.n_windows))
+
         # Grab seq_len + 1 raw uint32 values
         raw = torch.from_numpy(
             self.data[idx : idx + self.seq_len + 1].astype(np.int64)
@@ -168,7 +175,7 @@ def make_dataloader(
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=False,      # dataset picks random offsets itself in __getitem__
         num_workers=num_workers,
         pin_memory=True,    # faster CPU→GPU transfers
         drop_last=True,     # keep batch sizes consistent
