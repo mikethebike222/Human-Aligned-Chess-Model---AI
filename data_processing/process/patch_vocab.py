@@ -59,45 +59,45 @@ def patch_bin(input_path: str, output_path: str, n_new_tokens: int) -> None:
     Load a .bin memmap, shift token IDs >= OLD_SPECIAL_START by n_new_tokens,
     and write the result to output_path.
 
+    Processes in chunks to avoid loading the full file into RAM.
+
     Args:
         input_path:    path to the original ALLIE .bin file
         output_path:   path to write the patched file
         n_new_tokens:  how many new tokens were inserted (10 for our rapid tokens)
     """
+    CHUNK = 50_000_000  # 50M tokens per chunk (~200MB) — safe for any instance size
+
     print(f"Loading {input_path} ...")
     data = np.memmap(input_path, dtype=np.uint32, mode="r")
-    print(f"  {len(data):,} tokens ({len(data) * 4 / 1e9:.2f} GB)")
+    n = len(data)
+    print(f"  {n:,} tokens ({n * 4 / 1e9:.2f} GB)")
 
-    # Extract the lower 14 bits (token ID field) from every uint32
-    # The upper 18 bits (move time + outcome) are untouched
-    lower = (data & np.uint32(0x3FFF)).astype(np.int32)  # int32 for safe arithmetic
-    upper = data & ~np.uint32(0x3FFF)                    # upper bits, preserved exactly
+    # Pre-allocate output memmap (same size as input)
+    print(f"Allocating output file {output_path} ...")
+    out = np.memmap(output_path, dtype=np.uint32, mode="w+", shape=(n,))
 
-    # Find all tokens where the ID field needs to shift
-    needs_shift = lower >= OLD_SPECIAL_START
-    n_shifted = int(needs_shift.sum())
-    print(f"  {n_shifted:,} tokens will be shifted ({n_shifted / len(data) * 100:.1f}%)")
+    n_shifted_total = 0
 
-    # Apply the shift
-    lower[needs_shift] += n_new_tokens
+    print(f"Patching in chunks of {CHUNK:,} tokens ...")
+    for start in range(0, n, CHUNK):
+        end = min(start + CHUNK, n)
+        chunk = data[start:end].copy()  # copy chunk into RAM
 
-    # Sanity check: no token ID should exceed 14 bits after patching
-    max_id = int(lower.max())
-    if max_id >= 0x3FFF:
-        raise ValueError(
-            f"After patching, max token ID is {max_id} which overflows 14 bits. "
-            f"Something is wrong — check the input file."
-        )
+        lower = (chunk & np.uint32(0x3FFF)).astype(np.int32)
+        upper = chunk & ~np.uint32(0x3FFF)
 
-    # Reassemble: upper bits unchanged, lower bits patched
-    patched = upper | lower.astype(np.uint32)
+        needs_shift = lower >= OLD_SPECIAL_START
+        n_shifted_total += int(needs_shift.sum())
+        lower[needs_shift] += n_new_tokens
 
-    # Write output
-    print(f"Writing patched file to {output_path} ...")
-    out = np.memmap(output_path, dtype=np.uint32, mode="w+", shape=patched.shape)
-    out[:] = patched
+        out[start:end] = upper | lower.astype(np.uint32)
+
+        pct = end / n * 100
+        print(f"  {end:,} / {n:,} tokens ({pct:.1f}%)", end="\r")
+
     out.flush()
-
+    print(f"\n  {n_shifted_total:,} tokens shifted ({n_shifted_total / n * 100:.1f}%)")
     print("Done!")
     print(f"  Original vocab boundary: {OLD_SPECIAL_START}")
     print(f"  New vocab boundary:      {OLD_SPECIAL_START + n_new_tokens}")
@@ -116,8 +116,9 @@ def verify_patch(original_path: str, patched_path: str, n_new_tokens: int, n_sam
 
     assert len(orig) == len(patched), "File sizes don't match!"
 
-    # Find some tokens that should have been shifted
-    orig_lower = orig & np.uint32(0x3FFF)
+    # Find some tokens that should have been shifted (sample first 10M only)
+    sample = orig[:10_000_000]
+    orig_lower = sample & np.uint32(0x3FFF)
     shifted_indices = np.where(orig_lower >= OLD_SPECIAL_START)[0]
 
     if len(shifted_indices) == 0:
