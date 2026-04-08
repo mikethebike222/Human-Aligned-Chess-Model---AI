@@ -96,7 +96,8 @@ class ChessEmbedding(nn.Module):
             elo_embeddings = gamma * e_weak + (1 - gamma) * e_strong  # (n_elo, C)
 
             # Write Elo embeddings into the correct positions
-            embeddings[is_elo] = elo_embeddings
+            # Cast to match the destination dtype (bfloat16 during training)
+            embeddings[is_elo] = elo_embeddings.to(embeddings.dtype)
 
         return embeddings
 
