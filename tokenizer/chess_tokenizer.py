@@ -270,6 +270,10 @@ class ChessTokenizer:
         """Look up a token string's ID. Returns unk_id if not found."""
         return self._token_to_id.get(token, self.unk_id)
 
+    def time_control_to_id(self, time_control: str) -> int:
+        """Return the token ID for a time control string (e.g. '600+0')."""
+        return self._token_to_id.get(time_control, self.unk_id)
+
     def __len__(self) -> int:
         return self.vocab_size
 
