@@ -7,6 +7,11 @@ predicted move match the move a human actually played?
 Evaluated per 100-Elo bin across the full skill spectrum, following the
 same methodology as the ALLIE paper (Table 3 / Figure 2).
 
+Also evaluates:
+  - Special move accuracy: castling, pawn promotions
+  - Resignation prediction: does the model predict the termination token
+    at the end of resigned/checkmated games?
+
 Two positions are excluded from evaluation (same as ALLIE):
   - First 5 moves of each game (opening book — too many humans play the same moves)
   - Moves made with < 30s remaining on clock (time pressure = semi-random moves)
@@ -16,8 +21,8 @@ Target: beat Maia*'s overall accuracy of 51.6% (ALLIE paper Table 3).
 Usage:
     python eval.py \\
         --checkpoint checkpoints/checkpoint-2000000.pt \\
-        --test_dir   ~/data/lichess-2022-blitz-sampled \\
-        --config     medium
+        --test_dir   ~/data/test \\
+        --config     small
 """
 
 import argparse
@@ -36,8 +41,28 @@ from data_processing.files.chess_moves import CHESS_MOVES
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Move classification helpers
 # ---------------------------------------------------------------------------
+
+# The 4 castling moves in UCI notation
+CASTLING_MOVES = {"e1g1", "e1c1", "e8g8", "e8c8"}
+
+# Promotion piece suffixes
+PROMOTION_PIECES = {"q", "r", "b", "n"}
+
+
+def classify_move(uci: str) -> str:
+    """
+    Classify a UCI move string into a category.
+
+    Returns one of: "castling", "promotion", "regular"
+    """
+    if uci in CASTLING_MOVES:
+        return "castling"
+    if len(uci) == 5 and uci[-1] in PROMOTION_PIECES:
+        return "promotion"
+    return "regular"
+
 
 def elo_bin(elo: int, bin_size: int = 100) -> str:
     """Round an Elo to the nearest bin. e.g. 1543 → '1500'."""
@@ -65,74 +90,79 @@ def evaluate(model, tokenizer, games, device, config):
     """
     Run move-matching accuracy evaluation on a list of test games.
 
-    For each game, we feed the move history token-by-token and ask the model
-    to predict the next move. We count how often its top-1 prediction matches
-    the actual human move.
-
-    Returns:
-        overall_accuracy: float (0–1)
-        per_bin_accuracy: dict mapping Elo bin string → accuracy float
+    Returns a results dict containing:
+        overall_accuracy:     float
+        per_bin_accuracy:     dict bin_str → float
+        special_move_stats:   dict with castling / promotion breakdowns
+        resignation_accuracy: float
     """
     model.eval()
 
-    # We'll track correct and total predictions per Elo bin
+    MOVE_ID_SET  = set(range(len(CHESS_MOVES)))
+    TERMINATION_ID = tokenizer.termination_id
+
+    # --- Per-bin tracking ---
     bin_correct = defaultdict(int)
     bin_total   = defaultdict(int)
 
-    MOVE_ID_SET = set(range(len(CHESS_MOVES)))  # valid move token IDs (0–1967)
+    # --- Special move tracking ---
+    special_correct = defaultdict(int)  # key: "castling" / "promotion" / "regular"
+    special_total   = defaultdict(int)
+
+    # --- Resignation tracking ---
+    resign_correct = 0
+    resign_total   = 0
 
     for game_idx, game in enumerate(games):
-        if game_idx % 1000 == 0:
+        if game_idx % 500 == 0:
             print(f"  Evaluating game {game_idx:,} / {len(games):,} ...", end="\r")
 
-        moves      = game["moves-uci"].split()
-        times      = game["moves-seconds"]
-        white_elo  = int(game["white-elo"])
-        black_elo  = int(game["black-elo"])
-        time_ctrl  = game.get("time-control", "")
+        moves     = game["moves-uci"].split()
+        times     = game["moves-seconds"]
+        white_elo = int(game["white-elo"])
+        black_elo = int(game["black-elo"])
+        time_ctrl = game.get("time-control", "")
+        result    = game.get("result", "")
+        term      = game.get("termination", "")
 
-        # Parse time control for clock tracking
         try:
             base_time, increment = map(int, time_ctrl.split("+"))
         except Exception:
             continue
 
-        # Build the token prefix up to each position and predict next move
-        # We start from move index 5 (skip first 5 moves per ALLIE eval protocol)
         clock = [base_time, base_time]
+        avg_elo = (white_elo + black_elo) // 2
+        bin_key = elo_bin(avg_elo)
 
+        # -----------------------------------------------------------------
+        # Move-matching loop
+        # -----------------------------------------------------------------
         for move_idx in range(len(moves)):
-            # Track remaining clock time
             turn = move_idx % 2
             if move_idx < len(times):
                 clock[turn] = max(0, clock[turn] - times[move_idx] + increment)
 
-            # Skip first 5 moves (opening book)
             if move_idx < 5:
                 continue
-
-            # Skip moves made under time pressure (< 30s remaining)
             if clock[turn] < 30:
                 continue
 
-            # The move we're trying to predict is moves[move_idx]
-            actual_move = moves[move_idx]
+            actual_move    = moves[move_idx]
             actual_move_id = tokenizer.get_token_id(actual_move)
             if actual_move_id == tokenizer.unk_id:
-                continue  # move not in vocab, skip
+                continue
 
-            # Build context: all moves BEFORE this position
+            # Build context up to this position
             context_game = {
                 "moves-uci":     " ".join(moves[:move_idx]),
                 "moves-seconds": times[:move_idx],
                 "white-elo":     str(white_elo),
                 "black-elo":     str(black_elo),
                 "time-control":  time_ctrl,
-                "result":        game.get("result", "1/2-1/2"),
+                "result":        result,
                 "termination":   "",
             }
 
-            # Tokenize context (no termination/EOS — game isn't over yet)
             token_array = tokenizer.tokenize(
                 context_game,
                 add_elo=True,
@@ -140,64 +170,131 @@ def evaluate(model, tokenizer, games, device, config):
                 add_termination=False,
             )
 
-            # Truncate to max_seq_len from the RIGHT (keep most recent context)
             max_len = config.max_seq_len
             if len(token_array) > max_len:
                 token_array = token_array[-max_len:]
 
-            # Unpack token IDs (lower 14 bits) — strip time/outcome metadata
             input_ids = torch.tensor(
                 (token_array & 0x3FFF).astype(int),
                 dtype=torch.long,
                 device=device,
-            ).unsqueeze(0)  # (1, T)
+            ).unsqueeze(0)
 
             attention_mask = torch.ones_like(input_ids, dtype=torch.float)
 
-            # Forward pass — we only need the prediction at the LAST position
-            outputs = model(input_ids, attention_mask)
-            last_logits = outputs["policy_logits"][0, -1, :]  # (vocab_size,)
+            outputs     = model(input_ids, attention_mask)
+            last_logits = outputs["policy_logits"][0, -1, :]
 
-            # Mask out non-move tokens — we only want move predictions
-            # Set logits of special tokens, time controls, ELO tokens to -inf
+            # Mask to move tokens only
             move_mask = torch.full((config.vocab_size,), float("-inf"), device=device)
-            move_mask[:len(CHESS_MOVES)] = 0.0  # allow move tokens
+            move_mask[:len(CHESS_MOVES)] = 0.0
             last_logits = last_logits + move_mask
 
-            # Top-1 predicted move
             predicted_id = int(last_logits.argmax())
+            is_correct   = int(predicted_id == actual_move_id)
 
-            # Score it — use average of white and black Elo for the bin
-            avg_elo = (white_elo + black_elo) // 2
-            bin_key = elo_bin(avg_elo)
-
+            # Per-bin accuracy
             bin_total[bin_key]   += 1
-            bin_correct[bin_key] += int(predicted_id == actual_move_id)
+            bin_correct[bin_key] += is_correct
 
-    print()  # clear the \r line
+            # Special move accuracy
+            category = classify_move(actual_move)
+            special_total[category]   += 1
+            special_correct[category] += is_correct
 
-    # Compute per-bin and overall accuracy
+        # -----------------------------------------------------------------
+        # Resignation / checkmate prediction
+        # Only evaluate games that ended in resignation or checkmate
+        # -----------------------------------------------------------------
+        is_terminal = (
+            term.lower() in ("normal",)
+            and result in ("1-0", "0-1")
+            and len(moves) >= 5
+        )
+        if is_terminal:
+            # Feed the full game and check if model predicts termination token
+            full_game = {
+                "moves-uci":     " ".join(moves),
+                "moves-seconds": times,
+                "white-elo":     str(white_elo),
+                "black-elo":     str(black_elo),
+                "time-control":  time_ctrl,
+                "result":        result,
+                "termination":   "",
+            }
+
+            token_array = tokenizer.tokenize(
+                full_game,
+                add_elo=True,
+                add_time_control=True,
+                add_termination=False,
+            )
+
+            max_len = config.max_seq_len
+            if len(token_array) > max_len:
+                token_array = token_array[-max_len:]
+
+            input_ids = torch.tensor(
+                (token_array & 0x3FFF).astype(int),
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
+
+            attention_mask = torch.ones_like(input_ids, dtype=torch.float)
+
+            outputs     = model(input_ids, attention_mask)
+            last_logits = outputs["policy_logits"][0, -1, :]
+
+            # Here we do NOT mask to moves only — we want to see if the model
+            # predicts the termination token over all vocab tokens
+            predicted_id = int(last_logits.argmax())
+            resign_total   += 1
+            resign_correct += int(predicted_id == TERMINATION_ID)
+
+    print()
+
+    # Compute per-bin accuracy
     per_bin = {}
     total_correct = 0
     total_count   = 0
     for bin_key in sorted(bin_correct.keys(), key=lambda x: int(x)):
-        n     = bin_total[bin_key]
-        c     = bin_correct[bin_key]
-        acc   = c / n if n > 0 else 0.0
-        per_bin[bin_key] = acc
+        n = bin_total[bin_key]
+        c = bin_correct[bin_key]
+        per_bin[bin_key] = c / n if n > 0 else 0.0
         total_correct += c
         total_count   += n
 
     overall = total_correct / total_count if total_count > 0 else 0.0
-    return overall, per_bin
+
+    # Special move stats
+    special_stats = {}
+    for cat in ("castling", "promotion", "regular"):
+        n = special_total[cat]
+        c = special_correct[cat]
+        special_stats[cat] = {"correct": c, "total": n, "accuracy": c / n if n > 0 else 0.0}
+
+    resign_acc = resign_correct / resign_total if resign_total > 0 else 0.0
+
+    return {
+        "overall":     overall,
+        "per_bin":     per_bin,
+        "special":     special_stats,
+        "resignation": {"accuracy": resign_acc, "correct": resign_correct, "total": resign_total},
+    }
 
 
 # ---------------------------------------------------------------------------
 # Results display
 # ---------------------------------------------------------------------------
 
-def print_results(overall: float, per_bin: dict):
+def print_results(results: dict):
     """Print a formatted results table."""
+    overall  = results["overall"]
+    per_bin  = results["per_bin"]
+    special  = results["special"]
+    resign   = results["resignation"]
+
+    # --- Overall + Elo bin table ---
     print()
     print("=" * 55)
     print(f"  Overall move-matching accuracy:  {overall * 100:.2f}%")
@@ -207,8 +304,6 @@ def print_results(overall: float, per_bin: dict):
     print(f"  {'Elo bin':>10}  {'Accuracy':>10}  {'vs Maia*':>10}")
     print("-" * 55)
 
-    # Approximate Maia* accuracy per bin from the ALLIE paper (Figure 2)
-    # These are rough values read from the figure for reference
     maia_approx = {
         "600": 0.42, "700": 0.43, "800": 0.44, "900": 0.46,
         "1000": 0.47, "1100": 0.48, "1200": 0.49, "1300": 0.50,
@@ -223,6 +318,29 @@ def print_results(overall: float, per_bin: dict):
         delta = f"+{(acc - maia) * 100:.1f}%" if maia else "  n/a"
         print(f"  {bin_key + '-' + str(int(bin_key)+100):>10}  {acc * 100:>9.2f}%  {delta:>10}")
 
+    print("=" * 55)
+
+    # --- Special move breakdown ---
+    print()
+    print("=" * 55)
+    print("  SPECIAL MOVE ACCURACY")
+    print("=" * 55)
+    print(f"  {'Category':>12}  {'Accuracy':>10}  {'Correct':>8}  {'Total':>8}")
+    print("-" * 55)
+    for cat in ("regular", "castling", "promotion"):
+        s   = special[cat]
+        acc = s["accuracy"] * 100
+        print(f"  {cat:>12}  {acc:>9.2f}%  {s['correct']:>8,}  {s['total']:>8,}")
+    print("=" * 55)
+
+    # --- Resignation prediction ---
+    print()
+    print("=" * 55)
+    print("  RESIGNATION / CHECKMATE PREDICTION")
+    print("=" * 55)
+    racc = resign["accuracy"] * 100
+    print(f"  Accuracy:  {racc:.2f}%  ({resign['correct']:,} / {resign['total']:,} terminal positions)")
+    print(f"  (% of game-ending positions where model predicts <RESIGNED-OR-CHECKMATED>)")
     print("=" * 55)
 
 
@@ -241,7 +359,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load config + model
     config = SmallConfig() if args.config == "small" else MediumConfig()
     model  = ChessTransformer(config).to(device)
 
@@ -249,20 +366,15 @@ def main():
     model.load_state_dict(ckpt["model"])
     print(f"Loaded checkpoint from step {ckpt['step']}")
 
-    # Load tokenizer
     tokenizer = ChessTokenizer()
 
-    # Load test games
     games = load_test_games(args.test_dir)
     if args.max_games:
         games = games[:args.max_games]
 
-    # Run evaluation
     print(f"Evaluating {len(games):,} games...")
-    overall, per_bin = evaluate(model, tokenizer, games, device, config)
-
-    # Print results
-    print_results(overall, per_bin)
+    results = evaluate(model, tokenizer, games, device, config)
+    print_results(results)
 
 
 if __name__ == "__main__":
